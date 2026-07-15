@@ -18,6 +18,7 @@ import shutil
 import tempfile
 import subprocess
 import logging
+import glob
 from urllib.parse import quote
 
 import requests
@@ -449,6 +450,63 @@ def _safe_name(name: str) -> str:
     return (name[:120] or "video.mp4")
 
 
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "ios"}
+
+
+def _find_output_file(tmpdir: str):
+    candidates = [
+        p for p in glob.glob(os.path.join(tmpdir, "out.*"))
+        if os.path.isfile(p) and not os.path.basename(p).startswith(".")
+    ]
+    if not candidates:
+        candidates = [
+            os.path.join(tmpdir, f)
+            for f in os.listdir(tmpdir)
+            if not f.startswith(".") and os.path.isfile(os.path.join(tmpdir, f))
+        ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getsize(p), reverse=True)
+    return candidates[0]
+
+
+def _transcode_ios_mp4(source_path: str, tmpdir: str):
+    """Create an iPhone-compatible MP4: H.264/AAC, yuv420p, faststart."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg is missing on the server")
+
+    final_path = os.path.join(tmpdir, "ios-transcoded.mp4")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", source_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-profile:v", "main",
+        "-level", "4.1",
+        "-pix_fmt", "yuv420p",
+        "-vf", "scale='min(1920,iw)':-2",
+        "-c:a", "aac",
+        "-b:a", "160k",
+        "-movflags", "+faststart",
+        final_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=900)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "ignore").strip()
+        raise RuntimeError(err[:500] or "ffmpeg iPhone conversion failed")
+    return final_path
+
+
 @app.route("/download", methods=["GET", "POST"])
 def download():
     """Download a chosen format and, when needed, merge video+audio server-side.
@@ -475,6 +533,14 @@ def download():
         height = 0
     container = (data.get("container") or "mp4").strip().lower()
     if container not in {"mp4", "mkv", "webm", "m4a", "mp3"}:
+        container = "mp4"
+    ios_compat = (
+        _truthy(data.get("ios"))
+        or str(data.get("compat") or "").strip().lower() == "ios"
+        or str(data.get("transcode") or "").strip().lower() == "ios"
+        or _truthy(data.get("force_transcode"))
+    )
+    if ios_compat:
         container = "mp4"
     name = _safe_name(data.get("name") or f"video.{container}")
 
@@ -506,6 +572,18 @@ def download():
         # collapse to a bare "best" (which yields 360p on YouTube).
         if "bestvideo" not in fmt:
             fmt = f"{fmt}/{height_chain(h)}/bestvideo+bestaudio/best"
+
+    if ios_compat:
+        # For Instagram/iOS, do not require a pre-existing AVC stream. Some
+        # reels expose only VP9/AV1-ish MP4 variants; download the best usable
+        # stream first, then force a real H.264/AAC faststart MP4 with ffmpeg.
+        ios_height = f"[height<={h}]" if h else ""
+        fmt = "/".join([
+            f"bestvideo*{ios_height}+bestaudio/best{ios_height}",
+            f"bestvideo{ios_height}+bestaudio/best{ios_height}",
+            "bestvideo*+bestaudio/best",
+            "best",
+        ])
 
     tmpdir = tempfile.mkdtemp(prefix="grabit_")
     outtmpl = os.path.join(tmpdir, "out.%(ext)s")
@@ -548,7 +626,7 @@ def download():
     # YouTube's bot wall when logged out, so cookie-backed attempts must cover
     # the same height-scoped fallbacks too. Never fall back to a bare "best" —
     # that maps to 360p on YouTube.
-    fallback_fmt = height_chain(h) + "/bestvideo+bestaudio/best"
+    fallback_fmt = fmt if ios_compat else height_chain(h) + "/bestvideo+bestaudio/best"
     attempts = []
     if COOKIES_FILE:
         attempts.extend([
@@ -614,14 +692,29 @@ def download():
 
 
     # Find the produced file.
-    produced = [f for f in os.listdir(tmpdir) if not f.startswith(".")]
-    if not produced:
+    path = _find_output_file(tmpdir)
+    if not path:
         shutil.rmtree(tmpdir, ignore_errors=True)
         return jsonify({"error": "No output file produced"}), 500
-    path = os.path.join(tmpdir, produced[0])
+
+    ios_transcoded = False
+    if ios_compat and container == "mp4":
+        try:
+            original_path = path
+            path = _transcode_ios_mp4(original_path, tmpdir)
+            ios_transcoded = True
+            log.info("iOS transcode succeeded for %s", url)
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return jsonify({"error": "iPhone conversion timed out"}), 504
+        except Exception as e:
+            log.info("iOS transcode failed for %s: %s", url, e)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return jsonify({"error": f"iPhone conversion failed: {str(e)[:300]}"}), 500
+
     size = os.path.getsize(path)
 
-    real_ext = os.path.splitext(produced[0])[1].lstrip(".") or container
+    real_ext = "mp4" if ios_transcoded else (os.path.splitext(path)[1].lstrip(".") or container)
     if not name.lower().endswith("." + real_ext.lower()):
         name = os.path.splitext(name)[0] + "." + real_ext
 
@@ -645,14 +738,18 @@ def download():
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    headers = {
+        "Content-Disposition": f'attachment; filename="{quote(name)}"',
+        "Content-Length": str(size),
+        "Cache-Control": "no-store",
+    }
+    if ios_transcoded:
+        headers["X-IOS-Transcoded"] = "1"
+
     return Response(
         gen(),
         content_type=content_type,
-        headers={
-            "Content-Disposition": f'attachment; filename="{quote(name)}"',
-            "Content-Length": str(size),
-            "Cache-Control": "no-store",
-        },
+        headers=headers,
     )
 
 
