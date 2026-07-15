@@ -70,13 +70,18 @@ def check_auth():
 # ---------- helpers ----------
 YOUTUBE_CLIENT_PROFILES = (
     None,  # let the installed yt-dlp release choose its current safest defaults
-    ["default"],
+    ["android"],  # most reliable logged-out progressive fallback
     ["android_vr", "web", "web_safari"],
     ["web", "web_safari", "mweb"],
     ["tv_downgraded", "web"],
     ["web_embedded", "web"],
     ["android", "ios"],
 )
+
+# Railway images often do not have a local JS runtime for YouTube's changing
+# signature/n-challenge code. Let yt-dlp fetch its official EJS solver bundle
+# at runtime; without this many public YouTube links expose only storyboards.
+YOUTUBE_REMOTE_COMPONENTS = ["ejs:github"]
 
 
 def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True):
@@ -88,6 +93,9 @@ def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True)
         "extract_flat": False,
         "format": "all",
         "ignore_no_formats_error": True,
+        "remote_components": YOUTUBE_REMOTE_COMPONENTS,
+        "extractor_retries": 3,
+        "retries": 5,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -129,8 +137,36 @@ def is_direct_media_info(info: dict):
     return True
 
 
+def youtube_placeholder_formats(info: dict, url: str):
+    """Expose selectable quality rows even when metadata extraction succeeds
+    but YouTube withholds direct format URLs on the info endpoint. The download
+    endpoint will run yt-dlp again with the height-scoped selector.
+    """
+    webpage_url = info.get("webpage_url") or url
+    max_height = info.get("height") or info.get("resolution") or 2160
+    try:
+        max_height = int(str(max_height).split("x")[-1].replace("p", ""))
+    except Exception:
+        max_height = 2160
+    heights = [2160, 1440, 1080, 720, 480, 360]
+    return [{
+        "format_id": "",
+        "ext": "mp4",
+        "quality": f"{h}p",
+        "kind": "video-only",
+        "height": h,
+        "fps": None,
+        "abr": None,
+        "vcodec": "unknown",
+        "acodec": "none",
+        "filesize": None,
+        "url": webpage_url,
+    } for h in heights if h <= max_height or h <= 1080]
+
+
 def extract_info_with_fallback(url: str):
     attempts = []
+    last_info = None
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
 
     # YouTube cookies often go stale and can suppress formats. Try the
@@ -171,6 +207,7 @@ def extract_info_with_fallback(url: str):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = normalize_info(ydl.extract_info(url, download=False), url)
+            last_info = info
             if pick_formats(info) or is_direct_media_info(info):
                 log.info("yt-dlp succeeded for %s via %s", url, label)
                 info["_grabit_client_profile"] = label
@@ -184,6 +221,13 @@ def extract_info_with_fallback(url: str):
         except Exception as e:
             last_error = e
             log.info("yt-dlp failed for %s via %s: %s", url, label, e)
+
+    if is_youtube and isinstance(last_info, dict) and (last_info.get("title") or last_info.get("id")):
+        log.info("yt-dlp metadata-only fallback for %s; exposing height selectors", url)
+        last_info["formats"] = youtube_placeholder_formats(last_info, url)
+        last_info["_grabit_client_profile"] = "height-selector-fallback"
+        last_info["_grabit_used_cookies"] = False
+        return last_info
 
     log.info("yt-dlp exhausted all fallbacks for %s: %s", url, last_error)
     return {
@@ -299,7 +343,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 6,
+        "version": 7,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
@@ -420,9 +464,11 @@ def download():
             c += ["--merge-output-format", container]
         if container in {"mp3", "m4a"}:
             c += ["-x", "--audio-format", container]
+        c += ["--remote-components", "ejs:github", "--extractor-retries", "3", "--retries", "5", "--fragment-retries", "5"]
         if with_cookies and COOKIES_FILE:
             c += ["--cookies", COOKIES_FILE]
-        c += ["--extractor-args", f"youtube:player_client={player_clients}"]
+        if player_clients:
+            c += ["--extractor-args", f"youtube:player_client={player_clients}"]
         c += [
             "--user-agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -435,10 +481,12 @@ def download():
     # bare "best" — that maps to 360p on YouTube.
     fallback_fmt = height_chain(h) + "/bestvideo+bestaudio/best"
     attempts = [
-        (fmt, outtmpl, True, "web,mweb,android"),
-        (fallback_fmt, outtmpl + ".r1", False, "android,ios"),
-        (fallback_fmt, outtmpl + ".r2", False, "android_vr,web,web_safari"),
-        (fallback_fmt, outtmpl + ".r3", False, "default"),
+        (fmt, outtmpl, False, ""),
+        (fmt, outtmpl + ".r0", True, ""),
+        (fallback_fmt, outtmpl + ".r1", False, ""),
+        (fallback_fmt, outtmpl + ".r2", False, "android"),
+        (fallback_fmt, outtmpl + ".r3", False, "android,ios"),
+        (fallback_fmt, outtmpl + ".r4", False, "android_vr,web,web_safari"),
     ]
 
     proc = None
