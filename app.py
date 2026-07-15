@@ -79,7 +79,7 @@ YDL_COMMON = {
     },
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "tv_embedded", "web"],
+            "player_client": ["web", "mweb", "android"],
             "player_skip": ["configs"],
         }
     },
