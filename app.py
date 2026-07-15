@@ -143,12 +143,12 @@ def youtube_placeholder_formats(info: dict, url: str):
     endpoint will run yt-dlp again with the height-scoped selector.
     """
     webpage_url = info.get("webpage_url") or url
-    max_height = info.get("height") or info.get("resolution") or 2160
-    try:
-        max_height = int(str(max_height).split("x")[-1].replace("p", ""))
-    except Exception:
-        max_height = 2160
-    heights = [2160, 1440, 1080, 720, 480, 360]
+    # If YouTube only returns metadata (common with SABR / PO-token /
+    # challenge changes), reported height is often just the Android 360p
+    # fallback. Still expose high-quality selectors; /download will ask yt-dlp
+    # for the best available stream at or below the chosen height.
+    max_height = 4320
+    heights = [4320, 2160, 1440, 1080, 720, 480, 360]
     return [{
         "format_id": "",
         "ext": "mp4",
@@ -161,7 +161,7 @@ def youtube_placeholder_formats(info: dict, url: str):
         "acodec": "none",
         "filesize": None,
         "url": webpage_url,
-    } for h in heights if h <= max_height or h <= 1080]
+    } for h in heights if h <= max_height]
 
 
 def format_score(info: dict):
@@ -372,7 +372,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 8,
+        "version": 9,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
