@@ -64,28 +64,82 @@ def check_auth():
 
 
 # ---------- helpers ----------
-YDL_COMMON = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "noplaylist": True,
-    "extract_flat": False,
-    "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        )
-    },
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web", "mweb", "android"],
-            "player_skip": ["configs"],
+YOUTUBE_CLIENT_PROFILES = (
+    ["web", "mweb"],
+    ["android", "ios"],
+    ["tv_embedded", "web"],
+)
+
+
+def build_ydl_options(player_clients=None):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        # We only need metadata + direct URLs here. yt-dlp's default selector can
+        # throw "Requested format is not available" when YouTube exposes only
+        # DASH/adaptive formats for a client, even though useful formats exist.
+        "format": "all",
+        "ignore_no_formats_error": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        },
+    }
+    if player_clients:
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": player_clients,
+                "player_skip": ["configs"],
+            }
         }
-    },
-}
-if COOKIES_FILE:
-    YDL_COMMON["cookiefile"] = COOKIES_FILE
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+YDL_COMMON = build_ydl_options(["web", "mweb"])
+
+
+def normalize_info(info: dict, fallback_url: str):
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = info["entries"][0]
+    if not info.get("webpage_url"):
+        info["webpage_url"] = fallback_url
+    return info
+
+
+def extract_info_with_fallback(url: str):
+    attempts = []
+    # First try browser-like clients (cookies usually work best here), then
+    # mobile/embedded clients because YouTube availability differs by video.
+    for clients in YOUTUBE_CLIENT_PROFILES:
+        attempts.append(("youtube:" + ",".join(clients), build_ydl_options(clients)))
+    attempts.append(("default", build_ydl_options(None)))
+
+    last_error = None
+    for label, opts in attempts:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = normalize_info(ydl.extract_info(url, download=False), url)
+            if pick_formats(info) or info.get("formats") or info.get("url"):
+                log.info("yt-dlp succeeded for %s via %s", url, label)
+                return info
+            last_error = RuntimeError("No downloadable formats returned")
+            log.info("yt-dlp returned no formats for %s via %s", url, label)
+        except yt_dlp.utils.DownloadError as e:
+            last_error = e
+            log.info("yt-dlp failed for %s via %s: %s", url, label, e)
+        except Exception as e:
+            last_error = e
+            log.info("yt-dlp failed for %s via %s: %s", url, label, e)
+
+    raise last_error or RuntimeError("Could not fetch video")
 
 
 def pick_formats(info: dict):
@@ -107,16 +161,17 @@ def pick_formats(info: dict):
         is_video = vcodec and vcodec != "none"
         is_audio = acodec and acodec != "none"
 
-        if is_video and not is_audio:
-            continue
-
         if is_video:
             label = f"{height}p" if height else (fmt_note or ext.upper())
-            kind = "video"
-        else:
+            kind = "video" if is_audio else "video-only"
+        elif is_audio:
             label = f"Audio ({ext})"
             kind = "audio"
+        else:
+            continue
 
+        # Prefer playable progressive video when available, but keep adaptive
+        # video-only/audio-only as fallback instead of returning nothing.
         key = (kind, label, ext)
         if key in seen:
             continue
@@ -146,7 +201,8 @@ def pick_formats(info: dict):
     def sort_key(item):
         m = re.match(r"(\d+)p", item["quality"] or "")
         h = int(m.group(1)) if m else 0
-        return (0 if item["kind"] == "video" else 1, -h)
+        rank = {"video": 0, "video-only": 1, "audio": 2}.get(item["kind"], 3)
+        return (rank, -h)
 
     out.sort(key=sort_key)
     return out
@@ -158,7 +214,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 2,
+        "version": 3,
         "cookies_loaded": bool(COOKIES_FILE),
     })
 
@@ -172,17 +228,13 @@ def info():
         return jsonify({"error": "Missing 'url' in body"}), 400
 
     try:
-        with yt_dlp.YoutubeDL(YDL_COMMON) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = extract_info_with_fallback(url)
     except yt_dlp.utils.DownloadError as e:
-        log.info("yt-dlp failed for %s: %s", url, e)
+        log.info("yt-dlp exhausted fallbacks for %s: %s", url, e)
         return jsonify({"error": f"Could not fetch video: {str(e)}"}), 400
     except Exception as e:
         log.exception("Unexpected error for %s", url)
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
-
-    if info.get("_type") == "playlist" and info.get("entries"):
-        info = info["entries"][0]
 
     return jsonify({
         "title": info.get("title") or "Untitled",
