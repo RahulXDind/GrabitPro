@@ -4,7 +4,9 @@ GrabitPro yt-dlp backend.
 Endpoints:
   GET  /            -> health check
   POST /info        -> { url } -> video metadata + downloadable formats
-  GET  /stream      -> ?u=<direct_url>&name=<filename> streams the file
+  POST /download    -> { url, format, name? } -> merged mp4 stream (supports
+                        video-only + bestaudio merging up to 4K via ffmpeg)
+  GET  /stream      -> ?u=<direct_url>&name=<filename> streams a raw URL
 
 Auth: every request except `/` requires `Authorization: Bearer $API_SECRET`.
 """
@@ -12,13 +14,15 @@ Auth: every request except `/` requires `Authorization: Bearer $API_SECRET`.
 import os
 import re
 import base64
+import shutil
 import tempfile
+import subprocess
 import logging
 from urllib.parse import quote
 
 import requests
 import yt_dlp
-from flask import Flask, request, jsonify, Response, abort
+from flask import Flask, request, jsonify, Response, abort, stream_with_context
 from flask_cors import CORS
 
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +30,7 @@ log = logging.getLogger("grabit")
 
 API_SECRET = os.environ.get("API_SECRET", "")
 if not API_SECRET:
-    log.warning("API_SECRET is empty — /info and /stream are unprotected!")
+    log.warning("API_SECRET is empty — endpoints are unprotected!")
 
 # ---------- Load YouTube cookies from env (raw or base64) ----------
 COOKIES_FILE = None
@@ -79,9 +83,6 @@ def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True)
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
-        # We only need metadata + direct URLs here. yt-dlp's default selector can
-        # throw "Requested format is not available" when YouTube exposes only
-        # DASH/adaptive formats for a client, even though useful formats exist.
         "format": "all",
         "ignore_no_formats_error": True,
         "http_headers": {
@@ -116,8 +117,7 @@ def normalize_info(info: dict, fallback_url: str):
 def is_direct_media_info(info: dict):
     ext = (info.get("ext") or "").lower()
     proto = (info.get("protocol") or "").lower()
-    direct_url = info.get("url")
-    if not direct_url:
+    if not info.get("url"):
         return False
     if ext in {"mhtml", "html", "json", "xml", "vtt", "srt", "srv1", "srv2", "srv3", "ttml"}:
         return False
@@ -128,25 +128,29 @@ def is_direct_media_info(info: dict):
 
 def extract_info_with_fallback(url: str):
     attempts = []
-    # First try browser-like clients (cookies usually work best here), then
-    # mobile/embedded clients because YouTube availability differs by video.
     for clients in YOUTUBE_CLIENT_PROFILES:
         skip_configs = all(c in {"web", "mweb"} for c in clients)
-        attempts.append(("youtube:" + ",".join(clients), build_ydl_options(clients, skip_configs=skip_configs)))
-    # Some YouTube cookies trigger SABR/PO-token-only responses for mobile
-    # clients. If authenticated attempts return only storyboards, retry mobile
-    # extraction without cookies before giving up.
+        attempts.append((
+            "youtube:" + ",".join(clients),
+            build_ydl_options(clients, skip_configs=skip_configs),
+        ))
     for clients in (["android"], ["android", "ios"]):
-        attempts.append(("youtube:" + ",".join(clients) + ":nocookies", build_ydl_options(clients, use_cookies=False)))
+        attempts.append((
+            "youtube:" + ",".join(clients) + ":nocookies",
+            build_ydl_options(clients, use_cookies=False),
+        ))
     attempts.append(("default", build_ydl_options(None)))
 
     last_error = None
+    used_nocookies = False
     for label, opts in attempts:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = normalize_info(ydl.extract_info(url, download=False), url)
             if pick_formats(info) or is_direct_media_info(info):
                 log.info("yt-dlp succeeded for %s via %s", url, label)
+                info["_grabit_client_profile"] = label
+                info["_grabit_used_cookies"] = ":nocookies" not in label
                 return info
             last_error = RuntimeError("No downloadable formats returned")
             log.info("yt-dlp returned no formats for %s via %s", url, label)
@@ -161,6 +165,11 @@ def extract_info_with_fallback(url: str):
 
 
 def pick_formats(info: dict):
+    """Return every useful downloadable format the extractor exposed.
+
+    We keep progressive (audio+video), video-only, and audio-only entries so the
+    frontend can offer up to 4K by merging server-side on demand.
+    """
     formats = info.get("formats") or []
     out = []
     seen = set()
@@ -175,6 +184,8 @@ def pick_formats(info: dict):
         ext = (f.get("ext") or "mp4").lower()
         protocol = (f.get("protocol") or "").lower()
         height = f.get("height")
+        fps = f.get("fps")
+        abr = f.get("abr")
         fmt_note = f.get("format_note") or ""
 
         if ext in {"mhtml", "html", "json", "xml", "vtt", "srt", "srv1", "srv2", "srv3", "ttml"}:
@@ -186,16 +197,24 @@ def pick_formats(info: dict):
         is_audio = acodec and acodec != "none"
 
         if is_video:
-            label = f"{height}p" if height else (fmt_note or ext.upper())
-            kind = "video" if is_audio else "video-only"
+            base_label = f"{height}p" if height else (fmt_note or ext.upper())
+            if fps and fps >= 50 and height:
+                base_label = f"{height}p{int(fps)}"
+            if is_audio:
+                kind = "video"
+                label = base_label
+            else:
+                kind = "video-only"
+                label = base_label  # UI will indicate "merged"
         elif is_audio:
-            label = f"Audio ({ext})"
             kind = "audio"
+            if abr:
+                label = f"{ext.upper()} · {int(abr)}kbps"
+            else:
+                label = f"{ext.upper()} audio"
         else:
             continue
 
-        # Prefer playable progressive video when available, but keep adaptive
-        # video-only/audio-only as fallback instead of returning nothing.
         key = (kind, label, ext)
         if key in seen:
             continue
@@ -206,6 +225,11 @@ def pick_formats(info: dict):
             "ext": ext,
             "quality": label,
             "kind": kind,
+            "height": height,
+            "fps": fps,
+            "abr": abr,
+            "vcodec": vcodec,
+            "acodec": acodec,
             "filesize": f.get("filesize") or f.get("filesize_approx"),
             "url": url,
         })
@@ -218,13 +242,18 @@ def pick_formats(info: dict):
                 "ext": info.get("ext") or "mp4",
                 "quality": "Best available",
                 "kind": "video",
+                "height": info.get("height"),
+                "fps": info.get("fps"),
+                "abr": info.get("abr"),
+                "vcodec": info.get("vcodec"),
+                "acodec": info.get("acodec"),
                 "filesize": None,
                 "url": best,
             })
 
     def sort_key(item):
         m = re.match(r"(\d+)p", item["quality"] or "")
-        h = int(m.group(1)) if m else 0
+        h = int(m.group(1)) if m else (item.get("height") or 0)
         rank = {"video": 0, "video-only": 1, "audio": 2}.get(item["kind"], 3)
         return (rank, -h)
 
@@ -238,8 +267,9 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 3,
+        "version": 4,
         "cookies_loaded": bool(COOKIES_FILE),
+        "ffmpeg": bool(shutil.which("ffmpeg")),
     })
 
 
@@ -252,7 +282,7 @@ def info():
         return jsonify({"error": "Missing 'url' in body"}), 400
 
     try:
-        info = extract_info_with_fallback(url)
+        info_obj = extract_info_with_fallback(url)
     except yt_dlp.utils.DownloadError as e:
         log.info("yt-dlp exhausted fallbacks for %s: %s", url, e)
         return jsonify({"error": f"Could not fetch video: {str(e)}"}), 400
@@ -261,21 +291,179 @@ def info():
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
     return jsonify({
-        "title": info.get("title") or "Untitled",
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "uploader": info.get("uploader") or info.get("channel"),
-        "webpage_url": info.get("webpage_url") or url,
-        "extractor": info.get("extractor_key") or info.get("extractor"),
-        "formats": pick_formats(info),
+        "title": info_obj.get("title") or "Untitled",
+        "thumbnail": info_obj.get("thumbnail"),
+        "duration": info_obj.get("duration"),
+        "uploader": info_obj.get("uploader") or info_obj.get("channel"),
+        "webpage_url": info_obj.get("webpage_url") or url,
+        "extractor": info_obj.get("extractor_key") or info_obj.get("extractor"),
+        "client_profile": info_obj.get("_grabit_client_profile"),
+        "used_cookies": info_obj.get("_grabit_used_cookies"),
+        "formats": pick_formats(info_obj),
     })
+
+
+# ---------- download (merged) ----------
+def _safe_name(name: str) -> str:
+    name = re.sub(r"[\r\n\"\\/]+", " ", name or "").strip()
+    name = re.sub(r"[^\w.\-() ]+", "_", name)
+    return (name[:120] or "video.mp4")
+
+
+@app.route("/download", methods=["GET", "POST"])
+def download():
+    """Download a chosen format and, when needed, merge video+audio server-side.
+
+    Accepts JSON POST or query string GET with:
+      url         (required)  page URL
+      format      (optional)  yt-dlp format selector (default best up to 4K)
+      format_id   (optional)  a single format id — will be merged with bestaudio
+      name        (optional)  suggested filename
+      container   (optional)  mp4 (default) or mkv
+    """
+    check_auth()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+    else:
+        data = request.args
+
+    url = (data.get("url") or "").strip()
+    fmt = (data.get("format") or "").strip()
+    fmt_id = (data.get("format_id") or "").strip()
+    container = (data.get("container") or "mp4").strip().lower()
+    if container not in {"mp4", "mkv", "webm", "m4a", "mp3"}:
+        container = "mp4"
+    name = _safe_name(data.get("name") or f"video.{container}")
+
+    if not url:
+        return jsonify({"error": "Missing 'url'"}), 400
+
+    if not fmt:
+        if fmt_id:
+            # Merge chosen video with best audio (fallback to just the id).
+            fmt = f"{fmt_id}+bestaudio/best/{fmt_id}"
+        else:
+            fmt = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+
+    tmpdir = tempfile.mkdtemp(prefix="grabit_")
+    outtmpl = os.path.join(tmpdir, "out.%(ext)s")
+
+    cmd = [
+        "yt-dlp",
+        "-f", fmt,
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--no-progress",
+        "-o", outtmpl,
+    ]
+    if container in {"mp4", "mkv", "webm"}:
+        cmd += ["--merge-output-format", container]
+    if container in {"mp3", "m4a"}:
+        cmd += ["-x", "--audio-format", container]
+    if COOKIES_FILE:
+        cmd += ["--cookies", COOKIES_FILE]
+    # Broad extractor coverage for YouTube.
+    cmd += ["--extractor-args", "youtube:player_client=web,mweb,android"]
+    cmd += [
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    ]
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return jsonify({"error": "Download timed out"}), 504
+    except FileNotFoundError:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return jsonify({"error": "yt-dlp binary is missing on the server"}), 500
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        log.info("yt-dlp download failed for %s: %s", url, stderr[:500])
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        # Retry once without cookies — helps YouTube age-gate weirdness.
+        if COOKIES_FILE:
+            log.info("retrying %s without cookies", url)
+            tmpdir2 = tempfile.mkdtemp(prefix="grabit_")
+            outtmpl2 = os.path.join(tmpdir2, "out.%(ext)s")
+            cmd2 = [c for c in cmd if c != COOKIES_FILE and c != "--cookies"]
+            # Rebuild with new outtmpl
+            cmd2 = [
+                "yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", "--quiet",
+                "--no-progress", "-o", outtmpl2,
+            ]
+            if container in {"mp4", "mkv", "webm"}:
+                cmd2 += ["--merge-output-format", container]
+            if container in {"mp3", "m4a"}:
+                cmd2 += ["-x", "--audio-format", container]
+            cmd2 += ["--extractor-args", "youtube:player_client=android,ios"]
+            cmd2.append(url)
+            try:
+                proc = subprocess.run(cmd2, capture_output=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                shutil.rmtree(tmpdir2, ignore_errors=True)
+                return jsonify({"error": "Download timed out"}), 504
+            if proc.returncode != 0:
+                shutil.rmtree(tmpdir2, ignore_errors=True)
+                return jsonify({
+                    "error": (proc.stderr.decode("utf-8", "ignore").strip()[:400]
+                              or "Download failed"),
+                }), 500
+            tmpdir = tmpdir2
+        else:
+            return jsonify({"error": stderr[:400] or "Download failed"}), 500
+
+    # Find the produced file.
+    produced = [f for f in os.listdir(tmpdir) if not f.startswith(".")]
+    if not produced:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return jsonify({"error": "No output file produced"}), 500
+    path = os.path.join(tmpdir, produced[0])
+    size = os.path.getsize(path)
+
+    real_ext = os.path.splitext(produced[0])[1].lstrip(".") or container
+    if not name.lower().endswith("." + real_ext.lower()):
+        name = os.path.splitext(name)[0] + "." + real_ext
+
+    content_type = {
+        "mp4": "video/mp4",
+        "mkv": "video/x-matroska",
+        "webm": "video/webm",
+        "m4a": "audio/mp4",
+        "mp3": "audio/mpeg",
+    }.get(real_ext.lower(), "application/octet-stream")
+
+    @stream_with_context
+    def gen():
+        try:
+            with open(path, "rb") as fp:
+                while True:
+                    chunk = fp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return Response(
+        gen(),
+        content_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{quote(name)}"',
+            "Content-Length": str(size),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.get("/stream")
 def stream():
     check_auth()
     src = request.args.get("u", "").strip()
-    name = request.args.get("name", "video.mp4").strip() or "video.mp4"
+    name = _safe_name(request.args.get("name", "video.mp4"))
     if not src:
         return jsonify({"error": "Missing 'u'"}), 400
 
