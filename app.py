@@ -5,14 +5,14 @@ Endpoints:
   GET  /            -> health check
   POST /info        -> { url } -> video metadata + downloadable formats
   GET  /stream      -> ?u=<direct_url>&name=<filename> streams the file
-                        (optional: lets the frontend proxy through here if
-                         the CDN blocks hotlinking)
 
 Auth: every request except `/` requires `Authorization: Bearer $API_SECRET`.
 """
 
 import os
 import re
+import base64
+import tempfile
 import logging
 from urllib.parse import quote
 
@@ -27,6 +27,28 @@ log = logging.getLogger("grabit")
 API_SECRET = os.environ.get("API_SECRET", "")
 if not API_SECRET:
     log.warning("API_SECRET is empty — /info and /stream are unprotected!")
+
+# ---------- Load YouTube cookies from env (raw or base64) ----------
+COOKIES_FILE = None
+_raw = os.environ.get("YT_COOKIES", "").strip()
+_b64 = os.environ.get("YT_COOKIES_B64", "").strip()
+if _b64 and not _raw:
+    try:
+        _raw = base64.b64decode(_b64).decode("utf-8")
+        log.info("Decoded YT_COOKIES_B64 (%d chars)", len(_raw))
+    except Exception as e:
+        log.warning("YT_COOKIES_B64 decode failed: %s", e)
+if _raw:
+    try:
+        _f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        _f.write(_raw)
+        _f.close()
+        COOKIES_FILE = _f.name
+        log.info("Loaded YouTube cookies -> %s (%d chars)", COOKIES_FILE, len(_raw))
+    except Exception as e:
+        log.warning("Failed to write cookies file: %s", e)
+else:
+    log.info("No YT_COOKIES / YT_COOKIES_B64 set — running without cookies")
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -48,7 +70,6 @@ YDL_COMMON = {
     "skip_download": True,
     "noplaylist": True,
     "extract_flat": False,
-    # Pretend to be a normal desktop browser — helps IG / TikTok
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,8 +77,6 @@ YDL_COMMON = {
             "Chrome/124.0 Safari/537.36"
         )
     },
-    # YouTube: use android + tv clients to bypass "Sign in to confirm you're
-    # not a bot" checks that hit cloud IPs on the default web client.
     "extractor_args": {
         "youtube": {
             "player_client": ["android", "tv_embedded", "web"],
@@ -65,10 +84,11 @@ YDL_COMMON = {
         }
     },
 }
+if COOKIES_FILE:
+    YDL_COMMON["cookiefile"] = COOKIES_FILE
 
 
 def pick_formats(info: dict):
-    """Return a slim list of the useful downloadable formats."""
     formats = info.get("formats") or []
     out = []
     seen = set()
@@ -84,12 +104,10 @@ def pick_formats(info: dict):
         height = f.get("height")
         fmt_note = f.get("format_note") or ""
 
-        # Only keep progressive video (has both audio + video) OR audio-only mp3/m4a
         is_video = vcodec and vcodec != "none"
         is_audio = acodec and acodec != "none"
 
         if is_video and not is_audio:
-            # skip video-only streams (would need ffmpeg merge on client)
             continue
 
         if is_video:
@@ -113,7 +131,6 @@ def pick_formats(info: dict):
             "url": url,
         })
 
-    # If nothing progressive was found (common on YouTube), fall back to best mp4
     if not out:
         best = info.get("url")
         if best:
@@ -126,7 +143,6 @@ def pick_formats(info: dict):
                 "url": best,
             })
 
-    # Sort: video first (by height desc), then audio
     def sort_key(item):
         m = re.match(r"(\d+)p", item["quality"] or "")
         h = int(m.group(1)) if m else 0
@@ -139,7 +155,12 @@ def pick_formats(info: dict):
 # ---------- routes ----------
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "grabit-ytdlp", "version": 1})
+    return jsonify({
+        "ok": True,
+        "service": "grabit-ytdlp",
+        "version": 2,
+        "cookies_loaded": bool(COOKIES_FILE),
+    })
 
 
 @app.post("/info")
@@ -160,7 +181,6 @@ def info():
         log.exception("Unexpected error for %s", url)
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
-    # For playlists we already set noplaylist, but guard anyway
     if info.get("_type") == "playlist" and info.get("entries"):
         info = info["entries"][0]
 
@@ -177,8 +197,6 @@ def info():
 
 @app.get("/stream")
 def stream():
-    """Optional passthrough: stream a direct media URL back to the client.
-    Useful when the CDN blocks hotlink referers from the browser."""
     check_auth()
     src = request.args.get("u", "").strip()
     name = request.args.get("name", "video.mp4").strip() or "video.mp4"
