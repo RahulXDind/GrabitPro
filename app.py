@@ -71,7 +71,7 @@ YOUTUBE_CLIENT_PROFILES = (
 )
 
 
-def build_ydl_options(player_clients=None):
+def build_ydl_options(player_clients=None, skip_configs=False):
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -92,18 +92,16 @@ def build_ydl_options(player_clients=None):
         },
     }
     if player_clients:
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": player_clients,
-                "player_skip": ["configs"],
-            }
-        }
+        yt_args = {"player_client": player_clients}
+        if skip_configs:
+            yt_args["player_skip"] = ["configs"]
+        opts["extractor_args"] = {"youtube": yt_args}
     if COOKIES_FILE:
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
 
-YDL_COMMON = build_ydl_options(["web", "mweb"])
+YDL_COMMON = build_ydl_options(["web", "mweb"], skip_configs=True)
 
 
 def normalize_info(info: dict, fallback_url: str):
@@ -132,7 +130,8 @@ def extract_info_with_fallback(url: str):
     # First try browser-like clients (cookies usually work best here), then
     # mobile/embedded clients because YouTube availability differs by video.
     for clients in YOUTUBE_CLIENT_PROFILES:
-        attempts.append(("youtube:" + ",".join(clients), build_ydl_options(clients)))
+        skip_configs = all(c in {"web", "mweb"} for c in clients)
+        attempts.append(("youtube:" + ",".join(clients), build_ydl_options(clients, skip_configs=skip_configs)))
     attempts.append(("default", build_ydl_options(None)))
 
     last_error = None
