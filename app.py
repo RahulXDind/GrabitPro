@@ -56,6 +56,14 @@ YDL_COMMON = {
             "Chrome/124.0 Safari/537.36"
         )
     },
+    # YouTube: use android + tv clients to bypass "Sign in to confirm you're
+    # not a bot" checks that hit cloud IPs on the default web client.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "tv_embedded", "web"],
+            "player_skip": ["configs"],
+        }
+    },
 }
 
 
