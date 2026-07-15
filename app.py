@@ -299,7 +299,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 5,
+        "version": 6,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
@@ -365,6 +365,10 @@ def download():
     url = (data.get("url") or "").strip()
     fmt = (data.get("format") or "").strip()
     fmt_id = (data.get("format_id") or "").strip()
+    try:
+        height = int(data.get("height") or 0)
+    except (TypeError, ValueError):
+        height = 0
     container = (data.get("container") or "mp4").strip().lower()
     if container not in {"mp4", "mkv", "webm", "m4a", "mp3"}:
         container = "mp4"
@@ -373,83 +377,103 @@ def download():
     if not url:
         return jsonify({"error": "Missing 'url'"}), 400
 
+    # Build a resilient yt-dlp -f selector. The chain tries the exact format_id
+    # first, then progressively falls back to height-scoped video+audio pairs,
+    # and finally to "best" — never to a bare "best" that YouTube maps to 360p.
+    h = height if height and height > 0 else 2160
+
+    def height_chain(h_cap: int) -> str:
+        return (
+            f"bestvideo[height<={h_cap}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={h_cap}]+bestaudio/"
+            f"best[height<={h_cap}]"
+        )
+
     if not fmt:
+        parts = []
         if fmt_id:
-            # Merge chosen video with best audio (fallback to just the id).
-            fmt = f"{fmt_id}+bestaudio/best/{fmt_id}"
-        else:
-            fmt = "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
+            parts.append(f"{fmt_id}+bestaudio[ext=m4a]/{fmt_id}+bestaudio")
+        parts.append(height_chain(h))
+        # Absolute last resort: allow yt-dlp's own best merged selection.
+        parts.append("bestvideo+bestaudio/best")
+        fmt = "/".join(parts)
+    else:
+        # Frontend supplied a selector — still append a safety net so we never
+        # collapse to a bare "best" (which yields 360p on YouTube).
+        if "bestvideo" not in fmt:
+            fmt = f"{fmt}/{height_chain(h)}/bestvideo+bestaudio/best"
 
     tmpdir = tempfile.mkdtemp(prefix="grabit_")
     outtmpl = os.path.join(tmpdir, "out.%(ext)s")
 
-    cmd = [
-        "yt-dlp",
-        "-f", fmt,
-        "--no-playlist",
-        "--no-warnings",
-        "--quiet",
-        "--no-progress",
-        "-o", outtmpl,
-    ]
-    if container in {"mp4", "mkv", "webm"}:
-        cmd += ["--merge-output-format", container]
-    if container in {"mp3", "m4a"}:
-        cmd += ["-x", "--audio-format", container]
-    if COOKIES_FILE:
-        cmd += ["--cookies", COOKIES_FILE]
-    # Broad extractor coverage for YouTube.
-    cmd += ["--extractor-args", "youtube:player_client=web,mweb,android"]
-    cmd += [
-        "--user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    ]
-    cmd.append(url)
+    def build_cmd(target_fmt: str, out_template: str, with_cookies: bool, player_clients: str):
+        c = [
+            "yt-dlp",
+            "-f", target_fmt,
+            "--no-playlist",
+            "--no-warnings",
+            "--quiet",
+            "--no-progress",
+            "-o", out_template,
+        ]
+        if container in {"mp4", "mkv", "webm"}:
+            c += ["--merge-output-format", container]
+        if container in {"mp3", "m4a"}:
+            c += ["-x", "--audio-format", container]
+        if with_cookies and COOKIES_FILE:
+            c += ["--cookies", COOKIES_FILE]
+        c += ["--extractor-args", f"youtube:player_client={player_clients}"]
+        c += [
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        ]
+        c.append(url)
+        return c
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=900)
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"error": "Download timed out"}), 504
-    except FileNotFoundError:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"error": "yt-dlp binary is missing on the server"}), 500
+    # Attempt sequence: exact request with cookies, then height-scoped selector
+    # without cookies across different player clients. Never fall back to a
+    # bare "best" — that maps to 360p on YouTube.
+    fallback_fmt = height_chain(h) + "/bestvideo+bestaudio/best"
+    attempts = [
+        (fmt, outtmpl, True, "web,mweb,android"),
+        (fallback_fmt, outtmpl + ".r1", False, "android,ios"),
+        (fallback_fmt, outtmpl + ".r2", False, "android_vr,web,web_safari"),
+        (fallback_fmt, outtmpl + ".r3", False, "default"),
+    ]
 
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", "ignore").strip()
-        log.info("yt-dlp download failed for %s: %s", url, stderr[:500])
+    proc = None
+    used_tmpdir = tmpdir
+    last_err = ""
+    for target_fmt, out_template, with_cookies, clients in attempts:
+        attempt_dir = os.path.dirname(out_template) if out_template != outtmpl else tmpdir
+        if attempt_dir != tmpdir:
+            attempt_dir = tempfile.mkdtemp(prefix="grabit_")
+            out_template = os.path.join(attempt_dir, "out.%(ext)s")
+        cmd = build_cmd(target_fmt, out_template, with_cookies, clients)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            return jsonify({"error": "Download timed out"}), 504
+        except FileNotFoundError:
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            return jsonify({"error": "yt-dlp binary is missing on the server"}), 500
+
+        if proc.returncode == 0:
+            used_tmpdir = attempt_dir
+            break
+
+        last_err = proc.stderr.decode("utf-8", "ignore").strip()
+        log.info("yt-dlp download attempt failed (clients=%s cookies=%s fmt=%s): %s",
+                 clients, with_cookies, target_fmt[:80], last_err[:300])
+        if attempt_dir != tmpdir:
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+    else:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        # Retry once without cookies — helps YouTube age-gate weirdness.
-        if COOKIES_FILE:
-            log.info("retrying %s without cookies", url)
-            tmpdir2 = tempfile.mkdtemp(prefix="grabit_")
-            outtmpl2 = os.path.join(tmpdir2, "out.%(ext)s")
-            cmd2 = [c for c in cmd if c != COOKIES_FILE and c != "--cookies"]
-            # Rebuild with new outtmpl
-            cmd2 = [
-                "yt-dlp", "-f", fmt, "--no-playlist", "--no-warnings", "--quiet",
-                "--no-progress", "-o", outtmpl2,
-            ]
-            if container in {"mp4", "mkv", "webm"}:
-                cmd2 += ["--merge-output-format", container]
-            if container in {"mp3", "m4a"}:
-                cmd2 += ["-x", "--audio-format", container]
-            cmd2 += ["--extractor-args", "youtube:player_client=android,ios"]
-            cmd2.append(url)
-            try:
-                proc = subprocess.run(cmd2, capture_output=True, timeout=900)
-            except subprocess.TimeoutExpired:
-                shutil.rmtree(tmpdir2, ignore_errors=True)
-                return jsonify({"error": "Download timed out"}), 504
-            if proc.returncode != 0:
-                shutil.rmtree(tmpdir2, ignore_errors=True)
-                return jsonify({
-                    "error": (proc.stderr.decode("utf-8", "ignore").strip()[:400]
-                              or "Download failed"),
-                }), 500
-            tmpdir = tmpdir2
-        else:
-            return jsonify({"error": stderr[:400] or "Download failed"}), 500
+        return jsonify({"error": last_err[:400] or "Download failed"}), 500
+
+    tmpdir = used_tmpdir
+
 
     # Find the produced file.
     produced = [f for f in os.listdir(tmpdir) if not f.startswith(".")]
