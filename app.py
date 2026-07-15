@@ -403,7 +403,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 13,
+        "version": 14,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
@@ -479,32 +479,94 @@ def _transcode_ios_mp4(source_path: str, tmpdir: str):
     """Create an iPhone-compatible MP4: H.264/AAC, yuv420p, faststart."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg is missing on the server")
+    if not os.path.exists(source_path) or os.path.getsize(source_path) <= 0:
+        raise RuntimeError("downloaded source file is empty")
 
     final_path = os.path.join(tmpdir, "ios-transcoded.mp4")
-    cmd = [
+
+    def ffprobe_streams(path: str) -> str:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "stream=index,codec_type,codec_name,width,height,pix_fmt",
+                    "-of", "compact=p=0:nk=1",
+                    path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            return (probe.stdout.decode("utf-8", "ignore") or probe.stderr.decode("utf-8", "ignore")).strip()[:500]
+        except Exception as e:
+            return f"ffprobe unavailable: {e}"
+
+    base = [
         "ffmpeg",
         "-y",
         "-hide_banner",
-        "-loglevel", "error",
+        "-nostdin",
+        "-loglevel", "warning",
         "-i", source_path,
         "-map", "0:v:0",
         "-map", "0:a:0?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-profile:v", "main",
-        "-level", "4.1",
-        "-pix_fmt", "yuv420p",
-        "-vf", "scale='min(1920,iw)':-2",
-        "-c:a", "aac",
-        "-b:a", "160k",
-        "-movflags", "+faststart",
-        final_path,
+        "-max_muxing_queue_size", "4096",
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=900)
-    if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "ignore").strip()
-        raise RuntimeError(err[:500] or "ffmpeg iPhone conversion failed")
-    return final_path
+    common_tail = [
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-profile:v", "main",
+        "-pix_fmt", "yuv420p",
+        "-threads", "1",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+    ]
+    attempts = [
+        base + common_tail + [final_path],
+        base + ["-vf", "scale=-2:720"] + common_tail[2:] + [final_path],
+        [
+            "ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "warning",
+            "-i", source_path,
+            "-map", "0:v:0",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-profile:v", "main",
+            "-pix_fmt", "yuv420p",
+            "-threads", "1",
+            "-an",
+            "-movflags", "+faststart",
+            final_path,
+        ],
+    ]
+
+    source_desc = ffprobe_streams(source_path)
+    last_err = ""
+    for idx, cmd in enumerate(attempts, start=1):
+        if os.path.exists(final_path):
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+        proc = subprocess.run(cmd, capture_output=True, timeout=900)
+        if proc.returncode == 0 and os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+            log.info("iOS ffmpeg attempt %s succeeded; source=%s", idx, source_desc)
+            return final_path
+
+        stderr = proc.stderr.decode("utf-8", "ignore").strip()
+        stdout = proc.stdout.decode("utf-8", "ignore").strip()
+        last_err = (stderr or stdout or f"ffmpeg exited with code {proc.returncode}")[:700]
+        log.info(
+            "iOS ffmpeg attempt %s failed code=%s source=%s err=%s",
+            idx,
+            proc.returncode,
+            source_desc,
+            last_err[:500],
+        )
+
+    raise RuntimeError(last_err or "ffmpeg iPhone conversion failed")
 
 
 @app.route("/download", methods=["GET", "POST"])
