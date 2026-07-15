@@ -276,10 +276,24 @@ def extract_info_with_fallback(url: str):
         }
 
     log.info("yt-dlp exhausted all fallbacks for %s: %s", url, last_error)
+    details = str(last_error or "").strip()
+    if is_youtube and (not details or "no downloadable formats" in details.lower() or "no formats" in details.lower()):
+        return {
+            "error": "YOUTUBE_BLOCKED",
+            "fallback": True,
+            "details": (
+                "YouTube returned no downloadable streams from this server. "
+                "Refresh backend cookies from a logged-in browser or configure YTDLP_PROXY."
+            ),
+            "formats": [],
+            "webpage_url": url,
+            "title": "YouTube video",
+        }
+
     return {
         "error": "SERVICE_UNAVAILABLE",
         "fallback": True,
-        "details": str(last_error or "No downloadable formats returned"),
+        "details": details or "No downloadable formats returned",
         "formats": [],
         "webpage_url": url,
         "title": "Unavailable",
@@ -389,7 +403,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 11,
+        "version": 12,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
@@ -585,10 +599,16 @@ def download():
     else:
         shutil.rmtree(tmpdir, ignore_errors=True)
         friendly = last_err[:400] or "Download failed"
-        if "sign in to confirm" in last_err.lower() or "not a bot" in last_err.lower():
+        lower_err = last_err.lower()
+        if (
+            "sign in to confirm" in lower_err
+            or "not a bot" in lower_err
+            or "requested format is not available" in lower_err
+        ):
             friendly = (
-                "YouTube is blocking this server. Refresh the backend YouTube cookies "
-                "with a logged-in browser export, then redeploy and try again."
+                "YouTube is blocking this server or the current cookies are stale. "
+                "Refresh backend cookies from a logged-in browser, or configure YTDLP_PROXY "
+                "with a residential/proxy IP and redeploy."
             )
         return jsonify({"error": friendly}), 500
 
