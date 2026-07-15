@@ -65,13 +65,14 @@ def check_auth():
 
 # ---------- helpers ----------
 YOUTUBE_CLIENT_PROFILES = (
-    ["web", "mweb"],
+    ["android"],
     ["android", "ios"],
+    ["web", "mweb"],
     ["tv_embedded", "web"],
 )
 
 
-def build_ydl_options(player_clients=None, skip_configs=False):
+def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True):
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -96,7 +97,7 @@ def build_ydl_options(player_clients=None, skip_configs=False):
         if skip_configs:
             yt_args["player_skip"] = ["configs"]
         opts["extractor_args"] = {"youtube": yt_args}
-    if COOKIES_FILE:
+    if COOKIES_FILE and use_cookies:
         opts["cookiefile"] = COOKIES_FILE
     return opts
 
@@ -132,6 +133,11 @@ def extract_info_with_fallback(url: str):
     for clients in YOUTUBE_CLIENT_PROFILES:
         skip_configs = all(c in {"web", "mweb"} for c in clients)
         attempts.append(("youtube:" + ",".join(clients), build_ydl_options(clients, skip_configs=skip_configs)))
+    # Some YouTube cookies trigger SABR/PO-token-only responses for mobile
+    # clients. If authenticated attempts return only storyboards, retry mobile
+    # extraction without cookies before giving up.
+    for clients in (["android"], ["android", "ios"]):
+        attempts.append(("youtube:" + ",".join(clients) + ":nocookies", build_ydl_options(clients, use_cookies=False)))
     attempts.append(("default", build_ydl_options(None)))
 
     last_error = None
