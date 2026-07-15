@@ -164,9 +164,18 @@ def youtube_placeholder_formats(info: dict, url: str):
     } for h in heights if h <= max_height or h <= 1080]
 
 
+def format_score(info: dict):
+    picked = pick_formats(info)
+    max_height = max((f.get("height") or 0) for f in picked) if picked else 0
+    adaptive_count = sum(1 for f in picked if f.get("kind") == "video-only")
+    return (max_height, adaptive_count, len(picked))
+
+
 def extract_info_with_fallback(url: str):
     attempts = []
     last_info = None
+    best_info = None
+    best_score = (-1, -1, -1)
     is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
 
     # YouTube cookies often go stale and can suppress formats. Try the
@@ -208,11 +217,26 @@ def extract_info_with_fallback(url: str):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = normalize_info(ydl.extract_info(url, download=False), url)
             last_info = info
-            if pick_formats(info) or is_direct_media_info(info):
-                log.info("yt-dlp succeeded for %s via %s", url, label)
+            picked = pick_formats(info)
+            if picked or is_direct_media_info(info):
                 info["_grabit_client_profile"] = label
                 info["_grabit_used_cookies"] = ":nocookies" not in label
-                return info
+                if not is_youtube:
+                    log.info("yt-dlp succeeded for %s via %s", url, label)
+                    return info
+
+                score = format_score(info)
+                log.info("yt-dlp candidate for %s via %s: max_height=%s adaptive=%s formats=%s",
+                         url, label, score[0], score[1], score[2])
+                if score > best_score:
+                    best_info = info
+                    best_score = score
+                # Do not stop at Android's common 360p-only fallback. Keep
+                # searching for adaptive 720p/1080p/4K formats.
+                if score[0] >= 2160 or (score[0] >= 1080 and score[1] >= 2):
+                    log.info("yt-dlp succeeded for %s via %s", url, label)
+                    return info
+                continue
             last_error = RuntimeError("No downloadable formats returned")
             log.info("yt-dlp returned no formats for %s via %s", url, label)
         except yt_dlp.utils.DownloadError as e:
@@ -221,6 +245,11 @@ def extract_info_with_fallback(url: str):
         except Exception as e:
             last_error = e
             log.info("yt-dlp failed for %s via %s: %s", url, label, e)
+
+    if is_youtube and isinstance(best_info, dict):
+        log.info("yt-dlp using best available candidate for %s: max_height=%s adaptive=%s formats=%s",
+                 url, best_score[0], best_score[1], best_score[2])
+        return best_info
 
     if is_youtube and isinstance(last_info, dict) and (last_info.get("title") or last_info.get("id")):
         log.info("yt-dlp metadata-only fallback for %s; exposing height selectors", url)
@@ -343,7 +372,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 7,
+        "version": 8,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
