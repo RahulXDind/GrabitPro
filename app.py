@@ -131,6 +131,20 @@ def is_direct_media_info(info: dict):
 
 def extract_info_with_fallback(url: str):
     attempts = []
+    is_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+
+    # YouTube cookies often go stale and can suppress formats. Try the
+    # currently reliable logged-out clients first, then fall back to cookies.
+    if is_youtube:
+        for clients in (None, ["android"], ["android", "ios"], ["android_vr", "web", "web_safari"]):
+            if clients is None:
+                attempts.append(("yt-dlp:default:nocookies", build_ydl_options(None, use_cookies=False)))
+                continue
+            attempts.append((
+                "youtube:" + ",".join(clients) + ":nocookies",
+                build_ydl_options(clients, use_cookies=False),
+            ))
+
     for clients in YOUTUBE_CLIENT_PROFILES:
         if clients is None:
             attempts.append(("yt-dlp:default", build_ydl_options(None)))
@@ -140,14 +154,16 @@ def extract_info_with_fallback(url: str):
             "youtube:" + ",".join(clients),
             build_ydl_options(clients, skip_configs=skip_configs),
         ))
-    for clients in (None, ["android_vr", "web", "web_safari"], ["android"], ["android", "ios"]):
-        if clients is None:
-            attempts.append(("yt-dlp:default:nocookies", build_ydl_options(None, use_cookies=False)))
-            continue
-        attempts.append((
-            "youtube:" + ",".join(clients) + ":nocookies",
-            build_ydl_options(clients, use_cookies=False),
-        ))
+
+    if not is_youtube:
+        for clients in (None, ["android_vr", "web", "web_safari"], ["android"], ["android", "ios"]):
+            if clients is None:
+                attempts.append(("yt-dlp:default:nocookies", build_ydl_options(None, use_cookies=False)))
+                continue
+            attempts.append((
+                "youtube:" + ",".join(clients) + ":nocookies",
+                build_ydl_options(clients, use_cookies=False),
+            ))
 
     last_error = None
     used_nocookies = False
