@@ -114,6 +114,19 @@ def normalize_info(info: dict, fallback_url: str):
     return info
 
 
+def is_direct_media_info(info: dict):
+    ext = (info.get("ext") or "").lower()
+    proto = (info.get("protocol") or "").lower()
+    direct_url = info.get("url")
+    if not direct_url:
+        return False
+    if ext in {"mhtml", "html", "json", "xml", "vtt", "srt", "srv1", "srv2", "srv3", "ttml"}:
+        return False
+    if proto in {"mhtml", "http_dash_segments"}:
+        return False
+    return True
+
+
 def extract_info_with_fallback(url: str):
     attempts = []
     # First try browser-like clients (cookies usually work best here), then
@@ -127,7 +140,7 @@ def extract_info_with_fallback(url: str):
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = normalize_info(ydl.extract_info(url, download=False), url)
-            if pick_formats(info) or info.get("formats") or info.get("url"):
+            if pick_formats(info) or is_direct_media_info(info):
                 log.info("yt-dlp succeeded for %s via %s", url, label)
                 return info
             last_error = RuntimeError("No downloadable formats returned")
@@ -154,9 +167,15 @@ def pick_formats(info: dict):
 
         vcodec = f.get("vcodec")
         acodec = f.get("acodec")
-        ext = f.get("ext") or "mp4"
+        ext = (f.get("ext") or "mp4").lower()
+        protocol = (f.get("protocol") or "").lower()
         height = f.get("height")
         fmt_note = f.get("format_note") or ""
+
+        if ext in {"mhtml", "html", "json", "xml", "vtt", "srt", "srv1", "srv2", "srv3", "ttml"}:
+            continue
+        if protocol in {"mhtml", "http_dash_segments"}:
+            continue
 
         is_video = vcodec and vcodec != "none"
         is_audio = acodec and acodec != "none"
@@ -188,7 +207,7 @@ def pick_formats(info: dict):
 
     if not out:
         best = info.get("url")
-        if best:
+        if best and is_direct_media_info(info):
             out.append({
                 "format_id": "best",
                 "ext": info.get("ext") or "mp4",
