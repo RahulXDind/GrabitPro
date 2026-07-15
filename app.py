@@ -54,6 +54,10 @@ if _raw:
 else:
     log.info("No YT_COOKIES / YT_COOKIES_B64 set — running without cookies")
 
+YTDLP_PROXY = os.environ.get("YTDLP_PROXY", "").strip()
+if YTDLP_PROXY:
+    log.info("Using configured yt-dlp proxy")
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -96,6 +100,7 @@ def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True)
         "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         "extractor_retries": 3,
         "retries": 5,
+        "impersonate": "chrome",
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -111,6 +116,8 @@ def build_ydl_options(player_clients=None, skip_configs=False, use_cookies=True)
         opts["extractor_args"] = {"youtube": yt_args}
     if COOKIES_FILE and use_cookies:
         opts["cookiefile"] = COOKIES_FILE
+    if YTDLP_PROXY:
+        opts["proxy"] = YTDLP_PROXY
     return opts
 
 
@@ -252,11 +259,21 @@ def extract_info_with_fallback(url: str):
         return best_info
 
     if is_youtube and isinstance(last_info, dict) and (last_info.get("title") or last_info.get("id")):
-        log.info("yt-dlp metadata-only fallback for %s; exposing height selectors", url)
-        last_info["formats"] = youtube_placeholder_formats(last_info, url)
-        last_info["_grabit_client_profile"] = "height-selector-fallback"
-        last_info["_grabit_used_cookies"] = False
-        return last_info
+        log.info("yt-dlp metadata-only fallback for %s; YouTube blocked formats", url)
+        return {
+            "error": "YOUTUBE_BLOCKED",
+            "fallback": True,
+            "details": (
+                "YouTube returned metadata but no downloadable streams. "
+                "Refresh backend cookies from a logged-in browser or configure YTDLP_PROXY."
+            ),
+            "formats": [],
+            "webpage_url": last_info.get("webpage_url") or url,
+            "title": last_info.get("title") or "YouTube video",
+            "thumbnail": last_info.get("thumbnail"),
+            "uploader": last_info.get("uploader") or last_info.get("channel"),
+            "duration": last_info.get("duration"),
+        }
 
     log.info("yt-dlp exhausted all fallbacks for %s: %s", url, last_error)
     return {
@@ -372,10 +389,11 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 10,
+        "version": 11,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
+        "proxy_configured": bool(YTDLP_PROXY),
     })
 
 
@@ -493,7 +511,15 @@ def download():
             c += ["--merge-output-format", container]
         if container in {"mp3", "m4a"}:
             c += ["-x", "--audio-format", container]
-        c += ["--remote-components", "ejs:github", "--extractor-retries", "3", "--retries", "5", "--fragment-retries", "5"]
+        c += [
+            "--remote-components", "ejs:github",
+            "--extractor-retries", "3",
+            "--retries", "5",
+            "--fragment-retries", "5",
+            "--impersonate", "chrome",
+        ]
+        if YTDLP_PROXY:
+            c += ["--proxy", YTDLP_PROXY]
         if with_cookies and COOKIES_FILE:
             c += ["--cookies", COOKIES_FILE]
         if player_clients:
