@@ -69,10 +69,13 @@ def check_auth():
 
 # ---------- helpers ----------
 YOUTUBE_CLIENT_PROFILES = (
-    ["android"],
+    None,  # let the installed yt-dlp release choose its current safest defaults
+    ["default"],
+    ["android_vr", "web", "web_safari"],
+    ["web", "web_safari", "mweb"],
+    ["tv_downgraded", "web"],
+    ["web_embedded", "web"],
     ["android", "ios"],
-    ["web", "mweb"],
-    ["tv_embedded", "web"],
 )
 
 
@@ -129,17 +132,22 @@ def is_direct_media_info(info: dict):
 def extract_info_with_fallback(url: str):
     attempts = []
     for clients in YOUTUBE_CLIENT_PROFILES:
-        skip_configs = all(c in {"web", "mweb"} for c in clients)
+        if clients is None:
+            attempts.append(("yt-dlp:default", build_ydl_options(None)))
+            continue
+        skip_configs = all(c in {"web", "web_safari", "mweb"} for c in clients)
         attempts.append((
             "youtube:" + ",".join(clients),
             build_ydl_options(clients, skip_configs=skip_configs),
         ))
-    for clients in (["android"], ["android", "ios"]):
+    for clients in (None, ["android_vr", "web", "web_safari"], ["android"], ["android", "ios"]):
+        if clients is None:
+            attempts.append(("yt-dlp:default:nocookies", build_ydl_options(None, use_cookies=False)))
+            continue
         attempts.append((
             "youtube:" + ",".join(clients) + ":nocookies",
             build_ydl_options(clients, use_cookies=False),
         ))
-    attempts.append(("default", build_ydl_options(None)))
 
     last_error = None
     used_nocookies = False
@@ -275,7 +283,8 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 4,
+        "version": 5,
+        "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
     })
