@@ -161,7 +161,15 @@ def extract_info_with_fallback(url: str):
             last_error = e
             log.info("yt-dlp failed for %s via %s: %s", url, label, e)
 
-    raise last_error or RuntimeError("Could not fetch video")
+    log.info("yt-dlp exhausted all fallbacks for %s: %s", url, last_error)
+    return {
+        "error": "SERVICE_UNAVAILABLE",
+        "fallback": True,
+        "details": str(last_error or "No downloadable formats returned"),
+        "formats": [],
+        "webpage_url": url,
+        "title": "Unavailable",
+    }
 
 
 def pick_formats(info: dict):
@@ -283,6 +291,8 @@ def info():
 
     try:
         info_obj = extract_info_with_fallback(url)
+        if isinstance(info_obj, dict) and info_obj.get("fallback"):
+            return jsonify(info_obj), 200
     except yt_dlp.utils.DownloadError as e:
         log.info("yt-dlp exhausted fallbacks for %s: %s", url, e)
         return jsonify({"error": f"Could not fetch video: {str(e)}"}), 400
