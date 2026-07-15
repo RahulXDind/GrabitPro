@@ -372,7 +372,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "grabit-ytdlp",
-        "version": 9,
+        "version": 10,
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "unknown"),
         "cookies_loaded": bool(COOKIES_FILE),
         "ffmpeg": bool(shutil.which("ffmpeg")),
@@ -505,18 +505,29 @@ def download():
         c.append(url)
         return c
 
-    # Attempt sequence: exact request with cookies, then height-scoped selector
-    # without cookies across different player clients. Never fall back to a
-    # bare "best" — that maps to 360p on YouTube.
+    # Attempt sequence: try authenticated cookies across multiple YouTube
+    # clients before logged-out attempts. Railway/datacenter IPs often hit
+    # YouTube's bot wall when logged out, so cookie-backed attempts must cover
+    # the same height-scoped fallbacks too. Never fall back to a bare "best" —
+    # that maps to 360p on YouTube.
     fallback_fmt = height_chain(h) + "/bestvideo+bestaudio/best"
-    attempts = [
+    attempts = []
+    if COOKIES_FILE:
+        attempts.extend([
+            (fmt, outtmpl + ".c0", True, ""),
+            (fallback_fmt, outtmpl + ".c1", True, ""),
+            (fallback_fmt, outtmpl + ".c2", True, "web,mweb,android"),
+            (fallback_fmt, outtmpl + ".c3", True, "android"),
+            (fallback_fmt, outtmpl + ".c4", True, "android,ios"),
+            (fallback_fmt, outtmpl + ".c5", True, "android_vr,web,web_safari"),
+        ])
+    attempts.extend([
         (fmt, outtmpl, False, ""),
-        (fmt, outtmpl + ".r0", True, ""),
         (fallback_fmt, outtmpl + ".r1", False, ""),
         (fallback_fmt, outtmpl + ".r2", False, "android"),
         (fallback_fmt, outtmpl + ".r3", False, "android,ios"),
         (fallback_fmt, outtmpl + ".r4", False, "android_vr,web,web_safari"),
-    ]
+    ])
 
     proc = None
     used_tmpdir = tmpdir
@@ -547,7 +558,13 @@ def download():
             shutil.rmtree(attempt_dir, ignore_errors=True)
     else:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"error": last_err[:400] or "Download failed"}), 500
+        friendly = last_err[:400] or "Download failed"
+        if "sign in to confirm" in last_err.lower() or "not a bot" in last_err.lower():
+            friendly = (
+                "YouTube is blocking this server. Refresh the backend YouTube cookies "
+                "with a logged-in browser export, then redeploy and try again."
+            )
+        return jsonify({"error": friendly}), 500
 
     tmpdir = used_tmpdir
 
